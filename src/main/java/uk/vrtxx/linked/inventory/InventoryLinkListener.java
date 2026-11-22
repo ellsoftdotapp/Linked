@@ -49,6 +49,7 @@ public final class InventoryLinkListener implements Listener {
   private final Set<UUID> pendingPlayers = new LinkedHashSet<>();
   private final Set<UUID> miningPlayers = new LinkedHashSet<>();
   private final Set<UUID> deferredSyncPlayers = new LinkedHashSet<>();
+  private SharedInventory.Snapshot pendingBaseline;
   private boolean syncScheduled;
 
   public InventoryLinkListener(
@@ -232,6 +233,9 @@ public final class InventoryLinkListener implements Listener {
       return;
     }
 
+    if (!syncScheduled) {
+      pendingBaseline = sharedInventory.snapshot();
+    }
     pendingPlayers.add(player.getUniqueId());
 
     if (syncScheduled) {
@@ -250,14 +254,13 @@ public final class InventoryLinkListener implements Listener {
         return;
       }
 
-      // Capture every player before applying the shared inventory.
-      // This prevents one player's synchronization from overwriting
-      // another player's pending inventory changes.
+      // Merge each player's slot changes against the same pre-batch snapshot. Capturing each
+      // complete inventory here would let the last pending player overwrite unrelated changes.
       for (UUID uuid : pendingPlayers) {
         Player player = Bukkit.getPlayer(uuid);
 
         if (player != null && player.isOnline()) {
-          sharedInventory.capture(player);
+          sharedInventory.mergeChangesFrom(player, pendingBaseline);
         }
       }
 
@@ -265,6 +268,7 @@ public final class InventoryLinkListener implements Listener {
       syncAllPlayersWithoutInterruptingMining();
     } finally {
       syncScheduled = false;
+      pendingBaseline = null;
 
       // Schedule another pass if more changes arrived.
       if (!pendingPlayers.isEmpty()) {

@@ -8,6 +8,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import org.bukkit.Bukkit;
@@ -53,6 +54,34 @@ public final class SharedInventory {
     offhand = cloneItem(inventory.getItemInOffHand());
     enderChest = cloneItems(player.getEnderChest().getContents());
     initialized = true;
+  }
+
+  /**
+   * Merges the slots changed by {@code player} since {@code baseline} into the current shared
+   * inventory.
+   *
+   * <p>Several players can mutate the shared inventory in one server tick. Replacing the complete
+   * inventory for each of them makes the last player processed overwrite unrelated slot changes
+   * from the others. Comparing each player with the common state from before the batch lets those
+   * independent slot changes coexist. If two players change the same slot, the later event remains
+   * authoritative.
+   */
+  public void mergeChangesFrom(Player player, Snapshot baseline) {
+    PlayerInventory inventory = player.getInventory();
+    storage = mergeChangedItems(storage, baseline.storage, inventory.getStorageContents());
+    armor = mergeChangedItems(armor, baseline.armor, inventory.getArmorContents());
+    offhand =
+        sameItem(baseline.offhand, inventory.getItemInOffHand())
+            ? offhand
+            : cloneItem(inventory.getItemInOffHand());
+    enderChest =
+        mergeChangedItems(enderChest, baseline.enderChest, player.getEnderChest().getContents());
+    initialized = true;
+  }
+
+  /** Returns an immutable copy of the state used to detect changes in a sync batch. */
+  public Snapshot snapshot() {
+    return new Snapshot(storage, armor, offhand, enderChest);
   }
 
   public void apply(Player player) {
@@ -164,7 +193,7 @@ public final class SharedInventory {
     return ItemStack.deserializeItemsFromBytes(serializedItems);
   }
 
-  private ItemStack[] cloneItems(ItemStack[] items) {
+  private static ItemStack[] cloneItems(ItemStack[] items) {
     ItemStack[] cloned = new ItemStack[items.length];
     for (int index = 0; index < items.length; index++) {
       cloned[index] = cloneItem(items[index]);
@@ -172,7 +201,42 @@ public final class SharedInventory {
     return cloned;
   }
 
-  private ItemStack cloneItem(ItemStack item) {
-    return item == null ? null : item.clone();
+  private static ItemStack cloneItem(ItemStack item) {
+    return isEmpty(item) ? null : item.clone();
+  }
+
+  private ItemStack[] mergeChangedItems(
+      ItemStack[] current, ItemStack[] baseline, ItemStack[] playerItems) {
+    ItemStack[] merged = cloneItems(current);
+    for (int index = 0; index < merged.length; index++) {
+      if (!sameItem(baseline[index], playerItems[index])) {
+        merged[index] = cloneItem(playerItems[index]);
+      }
+    }
+    return merged;
+  }
+
+  private static boolean sameItem(ItemStack first, ItemStack second) {
+    return isEmpty(first) && isEmpty(second) || Objects.equals(first, second);
+  }
+
+  private static boolean isEmpty(ItemStack item) {
+    return item == null || item.getType().isAir() || item.getAmount() <= 0;
+  }
+
+  /** Immutable point-in-time copy of the shared inventory. */
+  public static final class Snapshot {
+    private final ItemStack[] storage;
+    private final ItemStack[] armor;
+    private final ItemStack offhand;
+    private final ItemStack[] enderChest;
+
+    private Snapshot(
+        ItemStack[] storage, ItemStack[] armor, ItemStack offhand, ItemStack[] enderChest) {
+      this.storage = cloneItems(storage);
+      this.armor = cloneItems(armor);
+      this.offhand = cloneItem(offhand);
+      this.enderChest = cloneItems(enderChest);
+    }
   }
 }
