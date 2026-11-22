@@ -96,7 +96,7 @@ public final class InventoryLinkListener implements Listener {
   @EventHandler(priority = EventPriority.MONITOR)
   public void onInventoryClose(InventoryCloseEvent event) {
     if (event.getPlayer() instanceof Player player) {
-      returnTransientItems(player, event.getInventory());
+      returnTransientItems(player, event.getInventory(), false);
     }
   }
 
@@ -104,7 +104,8 @@ public final class InventoryLinkListener implements Listener {
   public void onQuit(PlayerQuitEvent event) {
     miningPlayers.remove(event.getPlayer().getUniqueId());
     deferredSyncPlayers.remove(event.getPlayer().getUniqueId());
-    returnTransientItems(event.getPlayer(), event.getPlayer().getOpenInventory().getTopInventory());
+    returnTransientItems(
+        event.getPlayer(), event.getPlayer().getOpenInventory().getTopInventory(), true);
   }
 
   /**
@@ -281,7 +282,7 @@ public final class InventoryLinkListener implements Listener {
     }
   }
 
-  private void returnTransientItems(Player player, Inventory inventory) {
+  private void returnTransientItems(Player player, Inventory inventory, boolean playerIsQuitting) {
     if (!linkSettings.isInventoryLinkEnabled()) {
       return;
     }
@@ -306,12 +307,23 @@ public final class InventoryLinkListener implements Listener {
       return;
     }
 
-    // Return items to the source inventory first, then make that resulting inventory authoritative.
+    // Return items to the source inventory first. The resulting changes are then merged just like
+    // any other mutation, rather than making this one player's complete inventory authoritative.
     // A full shared inventory drops only the genuine overflow once, rather than voiding it.
     for (ItemStack item : player.getInventory().addItem(items.toArray(ItemStack[]::new)).values()) {
       player.getWorld().dropItemNaturally(player.getLocation(), item);
     }
-    sharedInventory.capture(player);
+
+    if (!playerIsQuitting) {
+      handleMutation(player);
+      return;
+    }
+
+    // A quit has no next tick on which to process this player. Use an in-flight batch's baseline
+    // when present so this final change cannot replace slots changed by other players that tick.
+    SharedInventory.Snapshot baseline =
+        pendingBaseline == null ? sharedInventory.snapshot() : pendingBaseline;
+    sharedInventory.mergeChangesFrom(player, baseline);
     pendingPlayers.remove(player.getUniqueId());
     syncAllPlayersWithoutInterruptingMining();
   }

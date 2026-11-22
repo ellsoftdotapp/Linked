@@ -8,6 +8,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -36,6 +38,9 @@ public final class SharedInventory {
   private ItemStack[] enderChest = new ItemStack[ENDER_CHEST_SIZE];
   private ItemStack offhand;
   private boolean initialized;
+  private Object nativeStorage;
+  private UUID nativeStorageOwner;
+  private boolean nativeStorageUnavailable;
 
   public SharedInventory(JavaPlugin plugin) {
     this.plugin = plugin;
@@ -68,7 +73,9 @@ public final class SharedInventory {
    */
   public void mergeChangesFrom(Player player, Snapshot baseline) {
     PlayerInventory inventory = player.getInventory();
-    storage = mergeChangedItems(storage, baseline.storage, inventory.getStorageContents());
+    if (!isStorageShared()) {
+      storage = mergeChangedItems(storage, baseline.storage, inventory.getStorageContents());
+    }
     armor = mergeChangedItems(armor, baseline.armor, inventory.getArmorContents());
     offhand =
         sameItem(baseline.offhand, inventory.getItemInOffHand())
@@ -86,10 +93,18 @@ public final class SharedInventory {
 
   public void apply(Player player) {
     PlayerInventory inventory = player.getInventory();
-    inventory.setStorageContents(cloneItems(storage));
+    boolean storageIsShared = shareNativeStorage(player);
+    if (!storageIsShared) {
+      inventory.setStorageContents(cloneItems(storage));
+    }
     inventory.setArmorContents(cloneItems(armor));
     inventory.setItemInOffHand(cloneItem(offhand));
     player.getEnderChest().setContents(cloneItems(enderChest));
+    if (storageIsShared) {
+      // A native list mutation is observed by the server immediately, but other players' clients
+      // still need an inventory packet because their own Inventory#setChanged was not invoked.
+      player.updateInventory();
+    }
   }
 
   public void syncAllPlayers() {
@@ -117,10 +132,21 @@ public final class SharedInventory {
     armor = new ItemStack[ARMOR_SIZE];
     offhand = null;
     initialized = true;
+    Player storagePlayer = getStoragePlayer();
+    if (storagePlayer != null) {
+      storagePlayer.getInventory().setStorageContents(cloneItems(storage));
+    } else {
+      nativeStorage = null;
+      nativeStorageOwner = null;
+    }
     syncAllPlayers();
   }
 
   public void save() {
+    Player storagePlayer = getStoragePlayer();
+    if (storagePlayer != null) {
+      capture(storagePlayer);
+    }
     try (DataOutputStream output =
         new DataOutputStream(new BufferedOutputStream(new FileOutputStream(inventoryFile)))) {
       output.writeInt(FILE_MAGIC);
@@ -222,6 +248,58 @@ public final class SharedInventory {
 
   private static boolean isEmpty(ItemStack item) {
     return item == null || item.getType().isAir() || item.getAmount() <= 0;
+  }
+
+  /**
+   * Makes every linked player's native storage list point to one list, mirroring SharedInv's
+   * reference-sharing model. Bukkit exposes no API for this, so the version-specific Paper bridge
+   * is deliberately isolated here and falls back to normal API synchronization if unavailable.
+   */
+  private boolean shareNativeStorage(Player player) {
+    if (nativeStorageUnavailable) {
+      return false;
+    }
+
+    try {
+      Object nativeInventory = getNativeInventory(player);
+      Field itemsField = nativeInventory.getClass().getDeclaredField("items");
+      itemsField.setAccessible(true);
+      if (nativeStorage == null) {
+        player.getInventory().setStorageContents(cloneItems(storage));
+        nativeStorage = itemsField.get(nativeInventory);
+        nativeStorageOwner = player.getUniqueId();
+      } else {
+        itemsField.set(nativeInventory, nativeStorage);
+      }
+      return true;
+    } catch (ReflectiveOperationException | SecurityException exception) {
+      nativeStorageUnavailable = true;
+      plugin
+          .getLogger()
+          .warning(
+              "Could not link Paper's native inventory storage; falling back to copy synchronization: "
+                  + exception.getMessage());
+      return false;
+    }
+  }
+
+  private boolean isStorageShared() {
+    return nativeStorage != null && !nativeStorageUnavailable;
+  }
+
+  private static Object getNativeInventory(Player player) throws ReflectiveOperationException {
+    Method getInventory = player.getInventory().getClass().getMethod("getInventory");
+    return getInventory.invoke(player.getInventory());
+  }
+
+  private Player getStoragePlayer() {
+    if (nativeStorageOwner != null) {
+      Player owner = Bukkit.getPlayer(nativeStorageOwner);
+      if (owner != null && owner.isOnline()) {
+        return owner;
+      }
+    }
+    return Bukkit.getOnlinePlayers().stream().findFirst().orElse(null);
   }
 
   /** Immutable point-in-time copy of the shared inventory. */
